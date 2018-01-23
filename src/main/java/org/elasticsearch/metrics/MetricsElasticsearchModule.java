@@ -44,7 +44,7 @@ import static org.elasticsearch.metrics.JsonMetrics.JsonTimer;
 
 public class MetricsElasticsearchModule extends Module {
 
-    public static final Version VERSION = new Version(3, 0, 0, "", "metrics-elasticsearch-reporter", "metrics-elasticsearch-reporter");
+    public static final Version VERSION = new Version(4, 0, 0, "", "metrics-elasticsearch-reporter", "metrics-elasticsearch-reporter");
 
     private static void writeAdditionalFields(final Map<String, Object> additionalFields, final JsonGenerator json) throws IOException {
         if (additionalFields != null) {

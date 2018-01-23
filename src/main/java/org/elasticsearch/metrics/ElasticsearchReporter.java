@@ -18,518 +18,292 @@
  */
 package org.elasticsearch.metrics;
 
-import com.codahale.metrics.*;
-import com.codahale.metrics.Timer;
-import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.core.JsonGenerator;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.ObjectWriter;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.module.afterburner.AfterburnerModule;
+import static com.codahale.metrics.MetricRegistry.name;
+import static org.elasticsearch.metrics.JsonMetrics.*;
 
-import org.elasticsearch.metrics.percolation.Notifier;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.text.SimpleDateFormat;
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import static com.codahale.metrics.MetricRegistry.name;
-import static org.elasticsearch.metrics.JsonMetrics.*;
-import static org.elasticsearch.metrics.MetricsElasticsearchModule.BulkIndexOperationHeader;
+import com.codahale.metrics.*;
+import com.codahale.metrics.Timer;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectWriter;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.module.afterburner.AfterburnerModule;
 
 public class ElasticsearchReporter extends ScheduledReporter {
 
-    public static Builder forRegistry(MetricRegistry registry) {
-        return new Builder(registry);
-    }
+	public static Builder forRegistry(MetricRegistry registry) {
+		return new Builder(registry);
+	}
 
-    public static class Builder {
-        private final MetricRegistry registry;
-        private Clock clock;
-        private String prefix;
-        private TimeUnit rateUnit;
-        private TimeUnit durationUnit;
-        private MetricFilter filter;
-        private String[] hosts = new String[]{ "localhost:9200" };
-        private String index = "metrics";
-        private String indexDateFormat = "yyyy-MM";
-        private int bulkSize = 2500;
-        private Notifier percolationNotifier;
-        private MetricFilter percolationFilter;
-        private int timeout = 1000;
-        private String timestampFieldname = "@timestamp";
-        private Map<String, Object> additionalFields;
+	public static class Builder {
+		private final MetricRegistry registry;
+		private Clock clock;
+		private String prefix;
+		private TimeUnit rateUnit;
+		private TimeUnit durationUnit;
+		private MetricFilter filter;
+		private String[] hosts = new String[] { "localhost:9200" };
+		private String index = "metrics";
+		private String indexDateFormat = "yyyy-MM";
+		private String docType = "doc";
+		private int bulkSize = 2500;
+		private int timeout = 1000;
+		private String timestampFieldname = "@timestamp";
+		private Map<String, Object> additionalFields;
+		private MetricElasticsearchClient elasticsearchClient;
 
-        private Builder(MetricRegistry registry) {
-            this.registry = registry;
-            this.clock = Clock.defaultClock();
-            this.prefix = null;
-            this.rateUnit = TimeUnit.SECONDS;
-            this.durationUnit = TimeUnit.MILLISECONDS;
-            this.filter = MetricFilter.ALL;
-        }
+		private Builder(MetricRegistry registry) {
+			this.registry = registry;
+			this.clock = Clock.defaultClock();
+			this.prefix = null;
+			this.rateUnit = TimeUnit.SECONDS;
+			this.durationUnit = TimeUnit.MILLISECONDS;
+			this.filter = MetricFilter.ALL;
+		}
 
-        /**
-         * Inject your custom definition of how time passes. Usually the default clock is sufficient
-         */
-        public Builder withClock(Clock clock) {
-            this.clock = clock;
-            return this;
-        }
+		/**
+		 * Inject your custom definition of how time passes. Usually the default
+		 * clock is sufficient
+		 */
+		public Builder withClock(Clock clock) {
+			this.clock = clock;
+			return this;
+		}
 
-        /**
-         * Configure a prefix for each metric name. Optional, but useful to identify single hosts
-         */
-        public Builder prefixedWith(String prefix) {
-            this.prefix = prefix;
-            return this;
-        }
+		/**
+		 * Configure a prefix for each metric name. Optional, but useful to
+		 * identify single hosts
+		 */
+		public Builder prefixedWith(String prefix) {
+			this.prefix = prefix;
+			return this;
+		}
 
-        /**
-         * Convert all the rates to a certain timeunit, defaults to seconds
-         */
-        public Builder convertRatesTo(TimeUnit rateUnit) {
-            this.rateUnit = rateUnit;
-            return this;
-        }
+		/**
+		 * Convert all the rates to a certain timeunit, defaults to seconds
+		 */
+		public Builder convertRatesTo(TimeUnit rateUnit) {
+			this.rateUnit = rateUnit;
+			return this;
+		}
 
-        /**
-         * Convert all the durations to a certain timeunit, defaults to milliseconds
-         */
-        public Builder convertDurationsTo(TimeUnit durationUnit) {
-            this.durationUnit = durationUnit;
-            return this;
-        }
+		/**
+		 * Convert all the durations to a certain timeunit, defaults to
+		 * milliseconds
+		 */
+		public Builder convertDurationsTo(TimeUnit durationUnit) {
+			this.durationUnit = durationUnit;
+			return this;
+		}
 
-        /**
-         * Allows to configure a special MetricFilter, which defines what metrics are reported
-         */
-        public Builder filter(MetricFilter filter) {
-            this.filter = filter;
-            return this;
-        }
+		/**
+		 * Allows to configure a special MetricFilter, which defines what
+		 * metrics are reported
+		 */
+		public Builder filter(MetricFilter filter) {
+			this.filter = filter;
+			return this;
+		}
 
-        /**
-         * Configure an array of hosts to send data to.
-         * Note: Data is always sent to only one host, but this makes sure, that even if a part of your elasticsearch cluster
-         *       is not running, reporting still happens
-         * A host must be in the format hostname:port
-         * The port must be the HTTP port of your elasticsearch instance
-         */
-        public Builder hosts(String ... hosts) {
-            this.hosts = hosts;
-            return this;
-        }
+		/**
+		 * The index name to index in
+		 */
+		public Builder index(String index) {
+			this.index = index;
+			return this;
+		}
 
-        /**
-         * The timeout to wait for until a connection attempt is and the next host is tried
-         */
-        public Builder timeout(int timeout) {
-            this.timeout = timeout;
-            return this;
-        }
+		/**
+		 * The index date format used for rolling indices This is appended to
+		 * the index name, split by a '-'
+		 */
+		public Builder indexDateFormat(String indexDateFormat) {
+			this.indexDateFormat = indexDateFormat;
+			return this;
+		}
 
-        /**
-         * The index name to index in
-         */
-        public Builder index(String index) {
-            this.index = index;
-            return this;
-        }
+		/**
+		 * The bulk size per request, defaults to 2500 (as metrics are quite
+		 * small)
+		 */
+		public Builder bulkSize(int bulkSize) {
+			this.bulkSize = bulkSize;
+			return this;
+		}
 
-        /**
-         * The index date format used for rolling indices
-         * This is appended to the index name, split by a '-'
-         */
-        public Builder indexDateFormat(String indexDateFormat) {
-            this.indexDateFormat = indexDateFormat;
-            return this;
-        }
+		/**
+		 * Configure the name of the timestamp field, defaults to '@timestamp'
+		 */
+		public Builder timestampFieldname(String fieldName) {
+			this.timestampFieldname = fieldName;
+			return this;
+		}
 
-        /**
-         * The bulk size per request, defaults to 2500 (as metrics are quite small)
-         */
-        public Builder bulkSize(int bulkSize) {
-            this.bulkSize = bulkSize;
-            return this;
-        }
+		/**
+		 * Additional fields to be included for each metric
+		 * 
+		 * @param additionalFields
+		 * @return
+		 */
+		public Builder additionalFields(Map<String, Object> additionalFields) {
+			this.additionalFields = additionalFields;
+			return this;
+		}
 
-        /**
-         * A metrics filter to define the metrics which should be used for percolation/notification
-         */
-        public Builder percolationFilter(MetricFilter percolationFilter) {
-            this.percolationFilter = percolationFilter;
-            return this;
-        }
+		public Builder setDocType(String docType) {
+			this.docType = docType;
+			return this;
+		}
 
-        /**
-         * An instance of the notifier implemention which should be executed in case of a matching percolation
-         */
-        public Builder percolationNotifier(Notifier notifier) {
-            this.percolationNotifier = notifier;
-            return this;
-        }
+		public Builder setElasticsearchClient(MetricElasticsearchClient elasticsearchClient) {
+			this.elasticsearchClient = elasticsearchClient;
+			return this;
+		}
 
-        /**
-         * Configure the name of the timestamp field, defaults to '@timestamp'
-         */
-        public Builder timestampFieldname(String fieldName) {
-            this.timestampFieldname = fieldName;
-            return this;
-        }
+		public ElasticsearchReporter build() {
+			return new ElasticsearchReporter(registry, elasticsearchClient, index, docType, indexDateFormat, bulkSize, clock, prefix, rateUnit, durationUnit, filter, timestampFieldname,
+					additionalFields);
+		}
+	}
 
-        /**
-         * Additional fields to be included for each metric
-         * @param additionalFields
-         * @return
-         */
-        public Builder additionalFields(Map<String, Object> additionalFields) {
-            this.additionalFields = additionalFields;
-            return this;
-        }
+	private static final Logger LOGGER = LoggerFactory.getLogger(ElasticsearchReporter.class);
 
-        public ElasticsearchReporter build() throws IOException {
-            return new ElasticsearchReporter(registry,
-                    hosts,
-                    timeout,
-                    index,
-                    indexDateFormat,
-                    bulkSize,
-                    clock,
-                    prefix,
-                    rateUnit,
-                    durationUnit,
-                    filter,
-                    percolationFilter,
-                    percolationNotifier,
-                    timestampFieldname,
-                    additionalFields);
-        }
-    }
+	private final Clock clock;
+	private final String prefix;
+	private final String index;
+	private final String docType;
+	private final int bulkSize;
+	private String timestampFieldname;
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(ElasticsearchReporter.class);
+	private final ObjectMapper objectMapper = new ObjectMapper();
+	private final ObjectWriter writer;
+	private MetricFilter percolationFilter;
+	private DateTimeFormatter indexDateFormat = null;
+	private boolean checkedForIndexTemplate = false;
+	private MetricElasticsearchClient elasticsearchClient;
 
-    private final String[] hosts;
-    private final Clock clock;
-    private final String prefix;
-    private final String index;
-    private final int bulkSize;
-    private final int timeout;
-    private final ObjectMapper objectMapper = new ObjectMapper();
-    private final ObjectWriter writer;
-    private MetricFilter percolationFilter;
-    private Notifier notifier;
-    private String currentIndexName;
-    private SimpleDateFormat indexDateFormat = null;
-    private boolean checkedForIndexTemplate = false;
+	public ElasticsearchReporter(MetricRegistry registry, MetricElasticsearchClient elasticsearchClient, String index, String docType, String indexDateFormat, int bulkSize, Clock clock, String prefix,
+			TimeUnit rateUnit, TimeUnit durationUnit, MetricFilter filter, String timestampFieldname, Map<String, Object> additionalFields) {
+		super(registry, "elasticsearch-reporter", filter, rateUnit, durationUnit);
+		this.index = index;
+		this.bulkSize = bulkSize;
+		this.clock = clock;
+		this.prefix = prefix;
+		this.elasticsearchClient = elasticsearchClient;
+		this.docType = docType;
+		if (indexDateFormat != null && indexDateFormat.length() > 0) {
+			this.indexDateFormat = DateTimeFormatter.ofPattern(indexDateFormat);
+		}
 
-    public ElasticsearchReporter(MetricRegistry registry, String[] hosts, int timeout,
-                                 String index, String indexDateFormat, int bulkSize, Clock clock, String prefix, TimeUnit rateUnit, TimeUnit durationUnit,
-                                 MetricFilter filter, MetricFilter percolationFilter, Notifier percolationNotifier, String timestampFieldname, Map<String, Object> additionalFields) throws MalformedURLException {
-        super(registry, "elasticsearch-reporter", filter, rateUnit, durationUnit);
-        this.hosts = hosts;
-        this.index = index;
-        this.bulkSize = bulkSize;
-        this.clock = clock;
-        this.prefix = prefix;
-        this.timeout = timeout;
-        if (indexDateFormat != null && indexDateFormat.length() > 0) {
-            this.indexDateFormat = new SimpleDateFormat(indexDateFormat);
-        }
-        if (percolationNotifier != null && percolationFilter != null) {
-            this.percolationFilter = percolationFilter;
-            this.notifier = percolationNotifier;
-        }
-        if (timestampFieldname == null || timestampFieldname.trim().length() == 0) {
-            LOGGER.error("Timestampfieldname {} is not valid, using default @timestamp", timestampFieldname);
-            timestampFieldname = "@timestamp";
-        }
+		if (timestampFieldname == null || timestampFieldname.trim().length() == 0) {
+			LOGGER.error("Timestampfieldname {} is not valid, using default @timestamp", timestampFieldname);
+			this.timestampFieldname = "@timestamp";
+		} else {
+			this.timestampFieldname = timestampFieldname;
+		}
 
-        objectMapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
-        objectMapper.configure(SerializationFeature.CLOSE_CLOSEABLE, false);
-        // auto closing means, that the objectmapper is closing after the first write call, which does not work for bulk requests
-        objectMapper.configure(JsonGenerator.Feature.AUTO_CLOSE_JSON_CONTENT, false);
-        objectMapper.configure(JsonGenerator.Feature.AUTO_CLOSE_TARGET, false);
-        objectMapper.registerModule(new AfterburnerModule());
-        objectMapper.registerModule(new MetricsElasticsearchModule(rateUnit, durationUnit, timestampFieldname, additionalFields));
-        writer = objectMapper.writer();
-        checkForIndexTemplate();
-    }
+		objectMapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
+		objectMapper.configure(SerializationFeature.CLOSE_CLOSEABLE, false);
+		// auto closing means, that the objectmapper is closing after the first
+		// write call, which does not work for bulk requests
+		objectMapper.configure(JsonGenerator.Feature.AUTO_CLOSE_JSON_CONTENT, false);
+		objectMapper.configure(JsonGenerator.Feature.AUTO_CLOSE_TARGET, false);
+		objectMapper.registerModule(new AfterburnerModule());
+		// objectMapper.registerModule(new
+		// MetricsModule(rateUnit,durationUnit,false,filter));
+		objectMapper.registerModule(new MetricsElasticsearchModule(rateUnit, durationUnit, timestampFieldname, additionalFields));
+		writer = objectMapper.writer();
+		// checkForIndexTemplate();
+	}
 
-    @Override
-    public void report(SortedMap<String, Gauge> gauges,
-                       SortedMap<String, Counter> counters,
-                       SortedMap<String, Histogram> histograms,
-                       SortedMap<String, Meter> meters,
-                       SortedMap<String, Timer> timers) {
+	private String buildIndexName(String type, String indexDateSuffix) {
+		String currentIndexName = index + "-" + type;
+		if (indexDateFormat != null) {
+			currentIndexName += indexDateSuffix;
+		}
+		return currentIndexName;
+	}
 
-        // nothing to do if we dont have any metrics to report
-        if (gauges.isEmpty() && counters.isEmpty() && histograms.isEmpty() && meters.isEmpty() && timers.isEmpty()) {
-            LOGGER.info("All metrics empty, nothing to report");
-            return;
-        }
+	private Optional<byte[]> convert(JsonMetric jsonMetric) {
+		byte[] data;
+		try {
+			data = objectMapper.writeValueAsBytes(jsonMetric);
+		} catch (JsonProcessingException e) {
+			data = null;
+			e.printStackTrace();
+		}
+		return Optional.of(data);
+	}
 
-        if (!checkedForIndexTemplate) {
-            checkForIndexTemplate();
-        }
-        final long timestamp = clock.getTime() / 1000;
+	@Override
+	public void report(SortedMap<String, Gauge> gauges, SortedMap<String, Counter> counters, SortedMap<String, Histogram> histograms, SortedMap<String, Meter> meters,
+			SortedMap<String, Timer> timers) {
 
-        currentIndexName = index;
-        if (indexDateFormat != null) {
-            currentIndexName += "-" + indexDateFormat.format(new Date(timestamp * 1000));
-        }
+		// nothing to do if we dont have any metrics to report
+		if (gauges.isEmpty() && counters.isEmpty() && histograms.isEmpty() && meters.isEmpty() && timers.isEmpty()) {
+			LOGGER.info("All metrics empty, nothing to report");
+			return;
+		}
 
-        try {
-            HttpURLConnection connection = openConnection("/_bulk", "POST");
-            if (connection == null) {
-                LOGGER.error("Could not connect to any configured elasticsearch instances: {}", Arrays.asList(hosts));
-                return;
-            }
+		if (!checkedForIndexTemplate) {
+			elasticsearchClient.checkForIndexTemplate(this.index, this.docType, this.timestampFieldname);
+		}
+		final long timestamp = clock.getTime() / 1000;
 
-            List<JsonMetric> percolationMetrics = new ArrayList<>();
-            AtomicInteger entriesWritten = new AtomicInteger(0);
+		String indexDateSuffix = "-" + LocalDateTime.ofEpochSecond(timestamp, 0, ZoneOffset.UTC).format(indexDateFormat);
 
-            for (Map.Entry<String, Gauge> entry : gauges.entrySet()) {
-                if (entry.getValue().getValue() != null) {
-                    JsonMetric jsonMetric = new JsonGauge(name(prefix, entry.getKey()), timestamp, entry.getValue());
-                    connection = writeJsonMetricAndRecreateConnectionIfNeeded(jsonMetric, connection, entriesWritten);
-                    addJsonMetricToPercolationIfMatching(jsonMetric, percolationMetrics);
-                }
-            }
+		List<byte[]> jsonMetrics = new ArrayList<>();
+		for (Map.Entry<String, Gauge> entry : gauges.entrySet()) {
+			if (entry.getValue().getValue() != null) {
+				JsonMetric jsonMetric = new JsonGauge(name(prefix, entry.getKey()), timestamp, entry.getValue());
+				convert(jsonMetric).ifPresent(jsonMetrics::add);
+			}
+		}
 
-            for (Map.Entry<String, Counter> entry : counters.entrySet()) {
-                JsonCounter jsonMetric = new JsonCounter(name(prefix, entry.getKey()), timestamp, entry.getValue());
-                connection = writeJsonMetricAndRecreateConnectionIfNeeded(jsonMetric, connection, entriesWritten);
-                addJsonMetricToPercolationIfMatching(jsonMetric, percolationMetrics);
-            }
+		write(indexDateSuffix, jsonMetrics, JsonGauge.TYPE);
 
-            for (Map.Entry<String, Histogram> entry : histograms.entrySet()) {
-                JsonHistogram jsonMetric = new JsonHistogram(name(prefix, entry.getKey()), timestamp, entry.getValue());
-                connection = writeJsonMetricAndRecreateConnectionIfNeeded(jsonMetric, connection, entriesWritten);
-                addJsonMetricToPercolationIfMatching(jsonMetric, percolationMetrics);
-            }
+		for (Map.Entry<String, Counter> entry : counters.entrySet()) {
+			JsonCounter jsonMetric = new JsonCounter(name(prefix, entry.getKey()), timestamp, entry.getValue());
+			convert(jsonMetric).ifPresent(jsonMetrics::add);
+		}
 
-            for (Map.Entry<String, Meter> entry : meters.entrySet()) {
-                JsonMeter jsonMetric = new JsonMeter(name(prefix, entry.getKey()), timestamp, entry.getValue());
-                connection = writeJsonMetricAndRecreateConnectionIfNeeded(jsonMetric, connection, entriesWritten);
-                addJsonMetricToPercolationIfMatching(jsonMetric, percolationMetrics);
-            }
+		write(indexDateSuffix, jsonMetrics, JsonCounter.TYPE);
 
-            for (Map.Entry<String, Timer> entry : timers.entrySet()) {
-                JsonTimer jsonMetric = new JsonTimer(name(prefix, entry.getKey()), timestamp, entry.getValue());
-                connection = writeJsonMetricAndRecreateConnectionIfNeeded(jsonMetric, connection, entriesWritten);
-                addJsonMetricToPercolationIfMatching(jsonMetric, percolationMetrics);
-            }
+		for (Map.Entry<String, Histogram> entry : histograms.entrySet()) {
+			JsonHistogram jsonMetric = new JsonHistogram(name(prefix, entry.getKey()), timestamp, entry.getValue());
+			convert(jsonMetric).ifPresent(jsonMetrics::add);
+		}
+		write(indexDateSuffix, jsonMetrics, JsonHistogram.TYPE);
 
-            closeConnection(connection);
+		for (Map.Entry<String, Meter> entry : meters.entrySet()) {
+			JsonMeter jsonMetric = new JsonMeter(name(prefix, entry.getKey()), timestamp, entry.getValue());
+			convert(jsonMetric).ifPresent(jsonMetrics::add);
+		}
+		write(indexDateSuffix, jsonMetrics, JsonMeter.TYPE);
+		for (Map.Entry<String, Timer> entry : timers.entrySet()) {
+			JsonTimer jsonMetric = new JsonTimer(name(prefix, entry.getKey()), timestamp, entry.getValue());
+			convert(jsonMetric).ifPresent(jsonMetrics::add);
+		}
+		write(indexDateSuffix, jsonMetrics, JsonTimer.TYPE);
 
-            // execute the notifier impl, in case percolation found matches
-            if (percolationMetrics.size() > 0 && notifier != null) {
-                for (JsonMetric jsonMetric : percolationMetrics) {
-                    List<String> matches = getPercolationMatches(jsonMetric);
-                    for (String match : matches) {
-                        notifier.notify(jsonMetric, match);
-                    }
-                }
-            }
-        // catch the exception to make sure we do not interrupt the live application
-        } catch (IOException e) {
-            LOGGER.error("Couldnt report to elasticsearch server", e);
-        }
-    }
+	}
 
-    /**
-     * Execute a percolation request for the specified metric
-     */
-    private List<String> getPercolationMatches(JsonMetric jsonMetric) throws IOException {
-        HttpURLConnection connection = openConnection("/" + currentIndexName + "/_search", "POST");
-        if (connection == null) {
-            LOGGER.error("Could not connect to any configured elasticsearch instances for percolation: {}", Arrays.asList(hosts));
-            return Collections.emptyList();
-        }
+	private void write(String indexDateSuffix, List<byte[]> data, String type) {
+		if (!data.isEmpty()) {
+			String currentIndexName = buildIndexName(type, indexDateSuffix);
+			elasticsearchClient.writeJsonMetricAsync(currentIndexName, this.docType, data, this.bulkSize);
+			data.clear();
+		}
+	}
 
-        JsonGenerator json = new JsonFactory().createGenerator(connection.getOutputStream());
-        json.setCodec(objectMapper);
-        json.writeStartObject();
-        json.writeObjectFieldStart("query");
-        json.writeObjectFieldStart("percolate");
-        json.writeStringField("field", "query");
-        json.writeStringField("document_type", jsonMetric.type());
-        json.writeObjectField("document", jsonMetric);
-        json.writeEndObject();
-        json.writeEndObject();
-        json.writeEndObject();
-        json.flush();
-
-        closeConnection(connection);
-
-        if (connection.getResponseCode() != 200) {
-            throw new RuntimeException("Error percolating " + jsonMetric);
-        }
-
-        List<String> matches = new ArrayList<>();
-        JsonNode input = objectMapper.readTree(connection.getInputStream());
-        if (input.has("hits")) {
-            JsonNode hits = input.get("hits");
-            if (hits.has("hits") && hits.get("hits").isArray()) {
-                for (JsonNode entry : (ArrayNode) hits.get("hits")) {
-                    if (entry.has("_id")) {
-                        matches.add(entry.get("_id").asText());
-                    }
-                }
-            }
-        }
-
-        return matches;
-    }
-
-    /**
-     * Add metric to list of matched percolation if needed
-     */
-    private void addJsonMetricToPercolationIfMatching(JsonMetric<? extends Metric> jsonMetric, List<JsonMetric> percolationMetrics) {
-        if (percolationFilter != null && percolationFilter.matches(jsonMetric.name(), jsonMetric.value())) {
-            percolationMetrics.add(jsonMetric);
-        }
-    }
-
-    private HttpURLConnection writeJsonMetricAndRecreateConnectionIfNeeded(JsonMetric jsonMetric, HttpURLConnection connection,
-                                                                           AtomicInteger entriesWritten) throws IOException {
-        writeJsonMetric(jsonMetric, writer, connection.getOutputStream());
-        return createNewConnectionIfBulkSizeReached(connection, entriesWritten.incrementAndGet());
-    }
-
-    private void closeConnection(HttpURLConnection connection) throws IOException {
-        connection.getOutputStream().close();
-        connection.disconnect();
-
-        // we have to call this, otherwise out HTTP data does not get send, even though close()/disconnect was called
-        // Ceterum censeo HttpUrlConnection esse delendam
-        if (connection.getResponseCode() != 200) {
-            LOGGER.error("Reporting returned code {} {}: {}", connection.getResponseCode(), connection.getResponseMessage());
-        }
-    }
-
-    /**
-     * Create a new connection when the bulk size has hit the limit
-     * Checked on every write of a metric
-     */
-    private HttpURLConnection createNewConnectionIfBulkSizeReached(HttpURLConnection connection, int entriesWritten) throws IOException {
-        if (entriesWritten % bulkSize == 0) {
-            closeConnection(connection);
-            return openConnection("/_bulk", "POST");
-        }
-
-        return connection;
-    }
-
-    /**
-     * serialize a JSON metric over the outputstream in a bulk request
-     */
-    private void writeJsonMetric(JsonMetric jsonMetric, ObjectWriter writer, OutputStream out) throws IOException {
-        writer.writeValue(out, new BulkIndexOperationHeader(currentIndexName, jsonMetric.type()));
-        out.write("\n".getBytes());
-        writer.writeValue(out, jsonMetric);
-        out.write("\n".getBytes());
-
-        out.flush();
-    }
-
-    /**
-     * Open a new HttpUrlConnection, in case it fails it tries for the next host in the configured list
-     */
-    private HttpURLConnection openConnection(String uri, String method) {
-        for (String host : hosts) {
-            try {
-                URL templateUrl = new URL("http://" + host  + uri);
-                HttpURLConnection connection = ( HttpURLConnection ) templateUrl.openConnection();
-                connection.setRequestMethod(method);
-                connection.setConnectTimeout(timeout);
-                connection.setUseCaches(false);
-                if (method.equalsIgnoreCase("POST") || method.equalsIgnoreCase("PUT")) {
-                    connection.setDoOutput(true);
-                }
-                connection.connect();
-
-                return connection;
-            } catch (IOException e) {
-                LOGGER.error("Error connecting to {}: {}", host, e);
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * This index template is automatically applied to all indices which start with the index name
-     * The index template simply configures the name not to be analyzed
-     */
-    private void checkForIndexTemplate() {
-        try {
-            HttpURLConnection connection = openConnection( "/_template/metrics_template", "HEAD");
-            if (connection == null) {
-                LOGGER.error("Could not connect to any configured elasticsearch instances: {}", Arrays.asList(hosts));
-                return;
-            }
-            connection.disconnect();
-
-            boolean isTemplateMissing = connection.getResponseCode() == HttpURLConnection.HTTP_NOT_FOUND;
-
-            // nothing there, lets create it
-            if (isTemplateMissing) {
-                LOGGER.debug("No metrics template found in elasticsearch. Adding...");
-                HttpURLConnection putTemplateConnection = openConnection( "/_template/metrics_template", "PUT");
-                if(putTemplateConnection == null) {
-                    LOGGER.error("Error adding metrics template to elasticsearch");
-                    return;
-                }
-                LOGGER.info("Creating metrics template matching index pattern of {}", index + "*");
-                JsonGenerator json = new JsonFactory().createGenerator(putTemplateConnection.getOutputStream());
-                json.writeStartObject();
-                json.writeStringField("template", index + "*");
-                json.writeObjectFieldStart("mappings");
-
-                json.writeObjectFieldStart("_default_");
-                json.writeObjectFieldStart("_all");
-                json.writeBooleanField("enabled", false);
-                json.writeEndObject();
-                json.writeObjectFieldStart("properties");
-                json.writeObjectFieldStart("name");
-                json.writeObjectField("type", "keyword");
-                json.writeEndObject();
-                json.writeEndObject();
-                json.writeEndObject();
-
-                //Percolator - ES 5.0+ changed how percolation queries are handled. Now need to be part of the mapping
-                json.writeObjectFieldStart("queries");
-                json.writeObjectFieldStart("properties");
-                json.writeObjectFieldStart("query");
-                json.writeStringField("type", "percolator");
-                json.writeEndObject();
-                json.writeEndObject();
-                json.writeEndObject();
-
-                json.writeEndObject();
-                json.writeEndObject();
-                json.flush();
-
-                putTemplateConnection.disconnect();
-                if (putTemplateConnection.getResponseCode() != 200) {
-                    LOGGER.error("Error adding metrics template to elasticsearch: {}/{}", putTemplateConnection.getResponseCode(), putTemplateConnection.getResponseMessage());
-                }
-            }
-            checkedForIndexTemplate = true;
-        } catch (IOException e) {
-            LOGGER.error("Error when checking/adding metrics template to elasticsearch", e);
-        }
-    }
 }
